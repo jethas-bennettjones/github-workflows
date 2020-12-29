@@ -1,0 +1,184 @@
+name: Build (without versioning)
+env:
+  webapp_path: BennettJones.Rates
+
+on:
+  push:
+    branches-ignore:
+      - main
+
+jobs:
+  build-angular:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{steps.version.outputs.version}}
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Setup NPM
+        uses: actions/setup-node@v1
+        with:
+          node-version: "12"
+          registry-url: "https://npm.pkg.github.com"
+
+      - name: Get npm cache directory
+        id: npm-cache
+        run: |
+          echo "::set-output name=dir::$(npm config get cache)"
+
+      - name: Cache npm cache
+        uses: actions/cache@v2
+        with:
+          path: ${{ steps.npm-cache.outputs.dir }}
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
+      - name: Install npm packages
+        working-directory: ./${{env.webapp_path}}/ClientApp
+        run: npm ci
+        env:
+          NODE_AUTH_TOKEN: ${{secrets.PULL_NPM}}
+          CYPRESS_INSTALL_BINARY: 0
+
+      - name: Lint Angular app
+        working-directory: ./${{env.webapp_path}}/ClientApp
+        run: npm run lint
+
+      - name: Bump Angular app version
+        id: pre-version
+        run: |
+          echo "::set-output name=version::$(npm version prerelease)"
+        working-directory: ./${{env.webapp_path}}/ClientApp
+
+      - id: version
+        run: |
+          version=$(echo ${{steps.pre-version.outputs.version}} | cut -dv -f2)
+          echo "::set-output name=version::$version"
+
+      - name: Compile Angular app
+        working-directory: ./${{env.webapp_path}}/ClientApp
+        run: npm run build:ci --node-flags --max-old-space-size=7168 -- -c=test
+
+      - name: Test Angular app
+        uses: cypress-io/github-action@v2
+        with:
+          working-directory: ./${{env.webapp_path}}/ClientApp
+          start: npx angular-http-server -g -p 4200 --path dist
+          wait-on: "http://localhost:4200"
+
+      - name: Publish Cypress Videos
+        uses: actions/upload-artifact@v2
+        if: always()
+        with:
+          name: Cypress Videos
+          path: ${{env.webapp_path}}/ClientApp/cypress/videos/
+
+      - name: Publish app
+        uses: actions/upload-artifact@v2
+        with:
+          name: angular-app
+          path: ./${{env.webapp_path}}/ClientApp/dist
+
+  test-dotnet:
+    runs-on: windows-latest
+    env:
+      DOTNET_NOLOGO: true
+    steps:
+      - uses: actions/checkout@v2
+      - name: Add .NET 3.1 SDK
+        uses: actions/setup-dotnet@v1
+        with:
+          dotnet-version: "3.1.x" # SDK Version to use; x will use the latest version of the 3.1 channel
+          source-url: https://nuget.pkg.github.com/bennettjones/index.json
+        env:
+          NUGET_AUTH_TOKEN: ${{secrets.PULL_NPM}}
+      - name: Add .NET 5.0 SDK
+        uses: actions/setup-dotnet@v1
+        with:
+          dotnet-version: "5.0.x" # SDK Version to use; x will use the latest version of the 3.1 channel
+          source-url: https://nuget.pkg.github.com/bennettjones/index.json
+        env:
+          NUGET_AUTH_TOKEN: ${{secrets.PULL_NPM}}
+
+      - name: Setup NuGet
+        uses: NuGet/setup-nuget@v1.0.5
+
+      - name: Cache NUGET packages
+        uses: actions/cache@v2
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/${{env.webapp_path}}.Web.csproj')}}
+
+      - name: Create node_modules folder # Needed so that the build process skips looking for "npm"
+        working-directory: ./${{env.webapp_path}}/ClientApp
+        run: New-Item -Type Directory -Name node_modules
+
+      - name: Test App (Unit Tests)
+        run: dotnet test --filter "FullyqualifiedName!~IntegrationTests"
+
+      # - name: Test App (Integration)
+      #   run: dotnet test --filter "FullyQualifiedName~IntegrationTests"
+
+  package:
+    needs: [build-angular, test-dotnet]
+    runs-on: windows-latest
+    env:
+      DOTNET_NOLOGO: true
+
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Add .NET 3.1 SDK
+        uses: actions/setup-dotnet@v1
+        with:
+          dotnet-version: "3.1.x" # SDK Version to use; x will use the latest version of the 3.1 channel
+          source-url: https://nuget.pkg.github.com/bennettjones/index.json
+        env:
+          NUGET_AUTH_TOKEN: ${{secrets.PULL_NPM}}
+
+      - name: Add .NET 5.0 SDK
+        uses: actions/setup-dotnet@v1
+        with:
+          dotnet-version: "5.0.x" # SDK Version to use; x will use the latest version of the 3.1 channel
+          source-url: https://nuget.pkg.github.com/bennettjones/index.json
+        env:
+          NUGET_AUTH_TOKEN: ${{secrets.PULL_NPM}}
+
+      - name: Setup NuGet
+        uses: NuGet/setup-nuget@v1.0.5
+
+      - name: Cache NUGET packages
+        uses: actions/cache@v2
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/${{env.webapp_path}}.Web.csproj')}}
+
+      - name: Download Angular app
+        uses: actions/download-artifact@v2
+        with:
+          name: angular-app
+          path: ./${{env.webapp_path}}/ClientApp/dist
+
+      - name: Bump Angular app version
+        run: |
+          npm version ${{needs.build-angular.outputs.version}}
+        working-directory: ./${{env.webapp_path}}/ClientApp
+
+      - name: Bump Dotnet Version
+        run: |
+          dotnet tool restore
+          dotnet dotnet-version --project-file ./${{env.webapp_path}}/${{env.webapp_path}}.Web.csproj --skip-vcs ${{needs.build-angular.outputs.version}}
+
+      - name: Publish App
+        run: dotnet publish ./${{env.webapp_path}}/${{env.webapp_path}}.Web.csproj -c TEST -o ./publish
+
+      - name: Create Artifact
+        uses: actions/upload-artifact@v2
+        with:
+          path: ./publish
+
+      - name: Zip Artifact
+        id: zip-artifact
+        run: |
+          Compress-Archive -Path .\publish\* -DestinationPath artifact.zip
